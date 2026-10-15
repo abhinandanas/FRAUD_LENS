@@ -1,0 +1,17 @@
+[
+  "amount",
+  "amount_vs_user_average",
+  "amount_z_score",
+  "transactions_last_1_minute",
+  "transactions_last_5_minutes",
+  "transactions_last_1_hour",
+  "transactions_today",
+  "hour_of_day",
+  "is_unusual_hour",
+  "distance_from_usual_location",
+  "distance_from_previous_transaction",
+  "is_new_device",
+  "user_device_count",
+  "merchant_category_frequency",
+  "merchant_category_deviation"
+]

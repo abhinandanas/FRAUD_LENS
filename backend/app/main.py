@@ -2,12 +2,21 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import UTC, datetime
+import logging
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
+
 import pandas as pd
+from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 try:
     from ml.features import build_behavioural_features
@@ -27,6 +36,143 @@ except ImportError:
     ML_ENGINE_AVAILABLE = False
 
 USER_HISTORY: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+logger = logging.getLogger(__name__)
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+_database_engine: Optional[Engine] = None
+
+
+def _get_database_engine() -> Engine:
+    global _database_engine
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="Transaction database is not configured.")
+    if _database_engine is None:
+        _database_engine = create_engine(
+            DATABASE_URL,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+            connect_args={"connect_timeout": 5},
+        )
+    return _database_engine
+
+
+TRANSACTION_QUERY = """
+SELECT
+    t.transaction_id,
+    t.timestamp,
+    t.amount,
+    t.merchant_name,
+    t.merchant_vpa,
+    t.device_id,
+    t.location_name,
+    t.fraud_label,
+    t.fraud_scenario,
+    u.full_name,
+    u.vpa,
+    a.risk_score,
+    a.risk_level,
+    a.alert_type,
+    a.status AS alert_status
+FROM transactions AS t
+LEFT JOIN users AS u ON u.user_id = t.user_id
+LEFT JOIN LATERAL (
+    SELECT risk_score, risk_level, alert_type, status
+    FROM alerts
+    WHERE alerts.transaction_id = t.id
+    ORDER BY created_at DESC
+    LIMIT 1
+) AS a ON TRUE
+"""
+
+
+def _query_transactions(
+    search: Optional[str] = None,
+    risk: Optional[str] = None,
+    transaction_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    conditions = []
+    params: Dict[str, Any] = {}
+    if search:
+        conditions.append(
+            "(u.full_name ILIKE :search OR t.transaction_id ILIKE :search OR u.vpa ILIKE :search)"
+        )
+        params["search"] = f"%{search}%"
+    if risk and risk.upper() != "ALL":
+        conditions.append(
+            "UPPER(COALESCE(a.risk_level, CASE WHEN t.fraud_label = 1 THEN 'HIGH' ELSE 'LOW' END)) = :risk"
+        )
+        params["risk"] = risk.upper()
+    if transaction_id:
+        conditions.append("t.transaction_id = :transaction_id")
+        params["transaction_id"] = transaction_id
+
+    query = TRANSACTION_QUERY
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY t.timestamp DESC, t.transaction_id DESC"
+
+    try:
+        with _get_database_engine().connect() as connection:
+            return [dict(row) for row in connection.execute(text(query), params).mappings()]
+    except SQLAlchemyError as exc:
+        logger.exception("Unable to query PostgreSQL transaction data")
+        raise HTTPException(
+            status_code=503,
+            detail="Transaction database is temporarily unavailable.",
+        ) from exc
+
+
+def _transaction_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    timestamp = row["timestamp"]
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    timestamp = timestamp.astimezone(ZoneInfo("Asia/Kolkata"))
+
+    amount = float(row["amount"])
+    fraud_label = bool(row["fraud_label"])
+    risk_level = row["risk_level"] or ("HIGH" if fraud_label else "LOW")
+    risk_score = row["risk_score"]
+    scenario = row["alert_type"] or row["fraud_scenario"]
+    trigger_signal = scenario.replace("_", " ").title() if scenario else "Baseline transaction"
+    alert_status = (row["alert_status"] or "").upper()
+    if alert_status in {"OPEN", "INVESTIGATING"}:
+        status = "Investigating"
+    elif alert_status:
+        status = "Resolved"
+    else:
+        status = "Review case" if fraud_label else "Cleared"
+    evidence = []
+    if fraud_label:
+        evidence.append(
+            {
+                "title": (scenario or "Fraud signal").replace("_", " ").upper(),
+                "description": f"Transaction flagged for {trigger_signal.lower()}.",
+                "severity": risk_level,
+            }
+        )
+
+    return {
+        "id": row["transaction_id"],
+        "rrn": "",
+        "user": row["full_name"] or row["vpa"] or row["transaction_id"],
+        "vpa": row["vpa"] or "",
+        "amount": amount,
+        "amountFormatted": f"₹{amount:,.0f}",
+        "triggerSignal": trigger_signal,
+        "riskLevel": risk_level,
+        "riskScore": risk_score,
+        "status": status,
+        "timestamp": timestamp.strftime("%H:%M:%S IST"),
+        "date": timestamp.strftime("%d %b %Y"),
+        "device": row["device_id"],
+        "location": row["location_name"] or "Unknown",
+        "merchant": row["merchant_name"],
+        "merchantVpa": row["merchant_vpa"] or "",
+        "merchantBankingName": row["merchant_name"],
+        "evidence": evidence,
+    }
 
 def _normalize_timestamp(value: Optional[datetime]) -> pd.Timestamp:
     if value is None:
@@ -78,116 +224,6 @@ OVERVIEW_DATA = {
         "status": "Handover Confirmed",
     },
 }
-
-TRANSACTIONS_DB = [
-    {
-        "id": "TX10291",
-        "rrn": "329810482910",
-        "user": "Rohit Kumar",
-        "vpa": "rohit.k@okaxis",
-        "amount": 38500,
-        "amountFormatted": "₹38,500",
-        "triggerSignal": "New device + 12x volume spike",
-        "riskLevel": "HIGH",
-        "riskScore": 84,
-        "status": "Review case",
-        "timestamp": "14:26:12 IST",
-        "date": "24 Oct 2026",
-        "device": "iPhone 15 Pro (Unbound)",
-        "location": "Bengaluru, KA",
-        "merchant": "Apex Gold & Jewellery",
-        "merchantVpa": "apexjewels@hdfcbank",
-        "merchantBankingName": "APEX BULLION TRADERS PVT LTD",
-        "evidence": [
-            {
-                "title": "AMOUNT ANOMALY",
-                "description": "Transaction amount (₹38,500) is 12.4x historical average (₹1,240).",
-                "severity": "CRITICAL",
-            },
-            {
-                "title": "UNRECOGNIZED HARDWARE",
-                "description": "Hardware signature DEVICE_99 not in user's 2 registered handsets.",
-                "severity": "HIGH",
-            },
-            {
-                "title": "VELOCITY SURGE",
-                "description": "4 transactions in 2 mins breaching 99.8th percentile rolling limit.",
-                "severity": "HIGH",
-            },
-            {
-                "title": "GEOLOCATION LEAP",
-                "description": "Mangaluru → Bengaluru (350 km in 79 mins, speed >260 km/h).",
-                "severity": "CRITICAL",
-            },
-        ],
-    },
-    {
-        "id": "TX10287",
-        "rrn": "329810482870",
-        "user": "Neha Sengupta",
-        "vpa": "nehasengupta@paytm",
-        "amount": 21200,
-        "amountFormatted": "₹21,200",
-        "triggerSignal": "Velocity burst (6 txns / 90s)",
-        "riskLevel": "CRITICAL",
-        "riskScore": 96,
-        "status": "Investigating",
-        "timestamp": "14:24:45 IST",
-        "date": "24 Oct 2026",
-        "device": "OnePlus 11 5G",
-        "location": "Kolkata, WB",
-        "merchant": "QuickCash Pay",
-        "merchantVpa": "quickcash@icici",
-        "merchantBankingName": "QUICK SERVICES PVT LTD",
-        "evidence": [
-            {
-                "title": "RAPID VELOCITY",
-                "description": "6 consecutive outbound transactions totaling ₹21,200 within 90 seconds.",
-                "severity": "CRITICAL",
-            },
-        ],
-    },
-    {
-        "id": "TX10284",
-        "rrn": "329810482840",
-        "user": "Rahul Singh",
-        "vpa": "rahulsingh@ybl",
-        "amount": 64000,
-        "amountFormatted": "₹64,000",
-        "triggerSignal": "Dormancy wake-up (48d inactive)",
-        "riskLevel": "HIGH",
-        "riskScore": 79,
-        "status": "Review case",
-        "timestamp": "14:20:02 IST",
-        "date": "24 Oct 2026",
-        "device": "Samsung Galaxy S24",
-        "location": "Mumbai, MH",
-        "merchant": "Global Crypto Exchange",
-        "merchantVpa": "globalcrypto@pnb",
-        "merchantBankingName": "GLOBAL TRADING VENTURES",
-        "evidence": [],
-    },
-    {
-        "id": "TX10280",
-        "rrn": "329810482800",
-        "user": "Winzo Gaming",
-        "vpa": "winzogaming@upi",
-        "amount": 9800,
-        "amountFormatted": "₹9,800",
-        "triggerSignal": "High velocity midnight burst",
-        "riskLevel": "MEDIUM",
-        "riskScore": 58,
-        "status": "Resolved",
-        "timestamp": "14:15:30 IST",
-        "date": "24 Oct 2026",
-        "device": "Redmi Note 13",
-        "location": "Delhi, DL",
-        "merchant": "Winzo Games India",
-        "merchantVpa": "pay@winzo",
-        "merchantBankingName": "WINZO GAMES PVT LTD",
-        "evidence": [],
-    },
-]
 
 DEMO_SCENARIOS = [
   {
@@ -326,16 +362,7 @@ def get_overview():
 
 @app.get("/api/transactions")
 def get_transactions(search: Optional[str] = None, risk: Optional[str] = None):
-    results = TRANSACTIONS_DB
-    if search:
-        s = search.lower()
-        results = [
-            t for t in results
-            if s in t["user"].lower() or s in t["id"].lower() or s in t["rrn"] or s in t["vpa"].lower()
-        ]
-    if risk and risk != "ALL":
-        results = [t for t in results if t["riskLevel"] == risk]
-    return results
+    return [_transaction_payload(row) for row in _query_transactions(search=search, risk=risk)]
 
 @app.get("/api/transactions/scenarios")
 def get_demo_scenarios():
@@ -343,10 +370,11 @@ def get_demo_scenarios():
 
 @app.get("/api/transactions/{id}")
 def get_transaction_by_id(id: str):
-    for tx in TRANSACTIONS_DB:
-        if tx["id"] == id:
-            return tx
-    raise HTTPException(status_code=404, detail="Transaction not found")
+    legacy_ids = {"TX10291": "U001-20240615095020-2042"}
+    results = _query_transactions(transaction_id=legacy_ids.get(id, id))
+    if not results:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    return _transaction_payload(results[0])
 
 @app.get("/api/simulator/scenarios")
 def get_simulator_scenarios():

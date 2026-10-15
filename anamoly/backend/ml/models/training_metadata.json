@@ -1,0 +1,27 @@
+{
+  "train_start": "2024-01-01 11:30:16",
+  "train_end": "2024-09-30 20:37:16",
+  "val_start": "2024-10-01 11:26:21",
+  "val_end": "2024-10-30 18:15:25",
+  "test_start": "2024-11-01 12:17:06",
+  "test_end": "2024-11-29 16:36:50",
+  "feature_columns": [
+    "amount",
+    "amount_vs_user_average",
+    "amount_z_score",
+    "transactions_last_1_minute",
+    "transactions_last_5_minutes",
+    "transactions_last_1_hour",
+    "transactions_today",
+    "hour_of_day",
+    "is_unusual_hour",
+    "distance_from_usual_location",
+    "distance_from_previous_transaction",
+    "is_new_device",
+    "user_device_count",
+    "merchant_category_frequency",
+    "merchant_category_deviation"
+  ],
+  "contamination": 0.02,
+  "model_name": "IsolationForest"
+}
